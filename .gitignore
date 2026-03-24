@@ -52,6 +52,8 @@ unlinked_spec.ds
 **/android/captures/
 **/android/gradlew
 **/android/gradlew.bat
+# Allow the project-level wrapper scripts
+!android/gradlew
 **/android/local.properties
 **/android/**/GeneratedPluginRegistrant.java
 **/android/key.properties
