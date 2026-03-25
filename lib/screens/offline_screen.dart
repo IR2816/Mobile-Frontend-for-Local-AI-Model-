@@ -1,22 +1,31 @@
 import 'package:flutter/material.dart';
 
+import '../services/ai_service.dart';
+
 class OfflineScreen extends StatefulWidget {
   final VoidCallback onRetry;
 
-  const OfflineScreen({super.key, required this.onRetry});
+  /// Optional message to display instead of the default explanation.
+  final String? message;
+
+  const OfflineScreen({super.key, required this.onRetry, this.message});
 
   @override
   State<OfflineScreen> createState() => _OfflineScreenState();
 }
 
 class _OfflineScreenState extends State<OfflineScreen> {
+  final AiService _aiService = AiService();
   bool _isRetrying = false;
 
   Future<void> _handleRetry() async {
     setState(() => _isRetrying = true);
-    await Future.delayed(const Duration(milliseconds: 300));
-    widget.onRetry();
-    if (mounted) setState(() => _isRetrying = false);
+    final isOnline = await _aiService.checkHealth();
+    if (!mounted) return;
+    setState(() => _isRetrying = false);
+    if (isOnline) {
+      widget.onRetry();
+    }
   }
 
   @override
@@ -43,13 +52,14 @@ class _OfflineScreenState extends State<OfflineScreen> {
                   ),
                 ),
                 const SizedBox(height: 16),
-                const Text(
-                  'Cannot reach llama-server on localhost:8080.\n\n'
-                  'Please open Termux and start the server with:\n\n'
-                  'llama-server -m /path/to/model.gguf \\\n'
-                  '  --host 0.0.0.0 --port 8080',
+                Text(
+                  widget.message ??
+                      'Cannot reach llama-server on localhost:8080.\n\n'
+                          'Please open Termux and start the server manually, '
+                          'or wait for Termux:Boot to start it automatically '
+                          'on next reboot.',
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.white70, height: 1.6),
+                  style: const TextStyle(color: Colors.white70, height: 1.6),
                 ),
                 const SizedBox(height: 32),
                 SizedBox(

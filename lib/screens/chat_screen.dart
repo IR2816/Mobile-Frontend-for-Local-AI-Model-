@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/message.dart';
 import '../services/ai_service.dart';
+import '../services/inactivity_service.dart';
 import '../services/storage_service.dart';
 import '../widgets/chat_bubble.dart';
 import '../widgets/typing_indicator.dart';
@@ -20,6 +21,8 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
 
+  late final InactivityService _inactivityService;
+
   List<Message> _messages = [];
   bool _isLoading = false;
   bool _isServerOnline = false;
@@ -28,11 +31,16 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    _inactivityService = InactivityService(
+      aiService: _aiService,
+      onTimeout: _onInactivityTimeout,
+    );
     _initialize();
   }
 
   @override
   void dispose() {
+    _inactivityService.dispose();
     _textController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -49,6 +57,7 @@ class _ChatScreenState extends State<ChatScreen> {
           _isChecking = false;
           _messages = history;
         });
+        _inactivityService.resetTimer();
         _scrollToBottom();
       }
     } else {
@@ -57,6 +66,31 @@ class _ChatScreenState extends State<ChatScreen> {
           _isServerOnline = false;
           _isChecking = false;
         });
+      }
+    }
+  }
+
+  Future<void> _retryHealthCheck() async {
+    setState(() => _isChecking = true);
+    final isOnline = await _aiService.checkHealth();
+    if (mounted) {
+      if (isOnline) {
+        setState(() {
+          _isServerOnline = true;
+          _isChecking = false;
+        });
+        _inactivityService.resetTimer();
+      } else {
+        setState(() {
+          _isServerOnline = false;
+          _isChecking = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Server is still offline.'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
       }
     }
   }
@@ -71,6 +105,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _isLoading = true;
     });
     _textController.clear();
+    _inactivityService.resetTimer();
     _scrollToBottom();
 
     try {
@@ -109,9 +144,51 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  Future<void> _clearChat() async {
-    await _storageService.clearHistory();
-    setState(() => _messages = []);
+  Future<void> _confirmClearChat() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear chat?'),
+        content: const Text(
+          'This will permanently delete the conversation history.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await _storageService.clearHistory();
+      if (mounted) {
+        setState(() => _messages = []);
+      }
+    }
+  }
+
+  void _onInactivityTimeout(String message) {
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute<void>(
+        builder: (_) => OfflineScreen(
+          message: message,
+          onRetry: () {
+            Navigator.of(context).pushReplacement(
+              MaterialPageRoute<void>(
+                builder: (_) => const ChatScreen(),
+              ),
+            );
+          },
+        ),
+      ),
+    );
   }
 
   @override
@@ -132,12 +209,21 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             const Text('Qwen2.5-7B'),
             const SizedBox(width: 8),
-            Container(
-              width: 10,
-              height: 10,
-              decoration: BoxDecoration(
-                color: _isServerOnline ? Colors.greenAccent : Colors.redAccent,
-                shape: BoxShape.circle,
+            GestureDetector(
+              onTap: _retryHealthCheck,
+              child: Semantics(
+                label: 'Server status: ${_isServerOnline ? 'online' : 'offline'}. Tap to retry health check.',
+                button: true,
+                child: Container(
+                  width: 10,
+                  height: 10,
+                  decoration: BoxDecoration(
+                    color: _isServerOnline
+                        ? Colors.greenAccent
+                        : Colors.redAccent,
+                    shape: BoxShape.circle,
+                  ),
+                ),
               ),
             ),
           ],
@@ -145,7 +231,7 @@ class _ChatScreenState extends State<ChatScreen> {
         actions: [
           IconButton(
             icon: const Icon(Icons.delete_outline_rounded),
-            onPressed: _messages.isEmpty ? null : _clearChat,
+            onPressed: _messages.isEmpty ? null : _confirmClearChat,
             tooltip: 'Clear chat',
           ),
         ],

@@ -8,6 +8,7 @@ class AiService {
   static const String _baseUrl = 'http://localhost:8080';
   static const String _chatEndpoint = '/v1/chat/completions';
   static const String _healthEndpoint = '/health';
+  static const String _stopEndpoint = '/stop';
 
   Future<bool> checkHealth() async {
     try {
@@ -43,8 +44,17 @@ class AiService {
     if (choices == null || choices.isEmpty) {
       throw Exception('No choices returned from server');
     }
-    final content =
-        choices[0]['message']['content'] as String;
+    final content = choices[0]['message']['content'] as String;
     return content;
+  }
+
+  Future<void> stopServer() async {
+    try {
+      await http
+          .get(Uri.parse('$_baseUrl$_stopEndpoint'))
+          .timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // Ignore errors — server may close the connection before responding.
+    }
   }
 }
