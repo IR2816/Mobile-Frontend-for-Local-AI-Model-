@@ -1,15 +1,18 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/message.dart';
 import '../services/ai_service.dart';
+import '../services/export_service.dart';
 import '../services/inactivity_service.dart';
 import '../services/memory_service.dart';
 import '../services/rag_service.dart';
 import '../services/settings_service.dart';
 import '../services/storage_service.dart';
 import '../services/tool_service.dart';
+import '../utils/constants.dart';
 import '../widgets/chat_bubble.dart';
 import '../widgets/tool_call_bubble.dart';
 import '../widgets/typing_indicator.dart';
@@ -26,12 +29,16 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  static const Duration _healthCheckInterval = Duration(seconds: 30);
+  // Exponential-backoff delays (seconds) used when the server is unreachable.
+  static const List<int> _backoffDelays = [1, 2, 4, 8];
+  static const String _lastHealthyKey = 'last_healthy_time';
+
   final StorageService _storageService = StorageService();
   final MemoryService _memoryService = MemoryService();
   final RagService _ragService = RagService();
   final ToolService _toolService = ToolService();
   final SettingsService _settingsService = SettingsService();
+  final ExportService _exportService = ExportService();
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
 
@@ -56,10 +63,19 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isServerOnline = false;
   bool _isChecking = true;
 
+  /// Whether a tool call is in progress (used to colour the typing indicator).
+  bool _isToolCalling = false;
+
   /// Streamed assistant response being built token-by-token.
   /// Non-null only while a streaming text response is in progress.
   String? _streamingContent;
 
+  // Connection-recovery tracking.
+  int _healthCheckFailures = 0;
+  DateTime? _lastHealthyTime;
+  DateTime? _wentOfflineAt;
+  // Prevents the ">5 min offline" warning from firing on every health check.
+  bool _offlineWarningShown = false;
   Timer? _healthTimer;
 
   @override
@@ -89,20 +105,37 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _initialize() async {
     setState(() => _isChecking = true);
 
-    // Load settings first so they're available before anything else.
+    // Load settings first so they are available before anything else.
     _settings = await _settingsService.loadAll();
-    _aiService = AiService(baseUrl: _settings.serverUrl);
 
-    // Recreate InactivityService so it references the correctly-configured
-    // AiService (in case the server URL has changed since last run).
-    _inactivityService.dispose();
-    _inactivityService = InactivityService(
-      aiService: _aiService,
-      onTimeout: _onInactivityTimeout,
-    );
+    // Recreate AiService only when the URL differs from the current one.
+    if (_aiService.baseUrl != _settings.serverUrl) {
+      _aiService = AiService(baseUrl: _settings.serverUrl);
+      _inactivityService.dispose();
+      _inactivityService = InactivityService(
+        aiService: _aiService,
+        onTimeout: _onInactivityTimeout,
+      );
+    }
+
+    // Restore persisted last-healthy timestamp.
+    final prefs = await SharedPreferences.getInstance();
+    final savedTime = prefs.getString(_lastHealthyKey);
+    if (savedTime != null) {
+      _lastHealthyTime = DateTime.tryParse(savedTime);
+    }
 
     final isOnline = await _aiService.checkHealth();
     if (isOnline) {
+      _lastHealthyTime = DateTime.now();
+      _healthCheckFailures = 0;
+      _wentOfflineAt = null;
+      _offlineWarningShown = false;
+      await prefs.setString(
+        _lastHealthyKey,
+        _lastHealthyTime!.toIso8601String(),
+      );
+
       final history = await _storageService.loadHistory();
       if (mounted) {
         setState(() {
@@ -117,10 +150,11 @@ class _ChatScreenState extends State<ChatScreen> {
           }
         });
         _inactivityService.resetTimer();
-        _startPeriodicHealthChecks();
+        _startHealthChecks();
         _scrollToBottom();
       }
     } else {
+      _wentOfflineAt ??= DateTime.now();
       if (mounted) {
         setState(() {
           _isServerOnline = false;
@@ -130,17 +164,71 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _startPeriodicHealthChecks() {
+  // Non-periodic health check that reschedules itself with backoff.
+  void _startHealthChecks() {
     _healthTimer?.cancel();
-    _healthTimer = Timer.periodic(
-      _healthCheckInterval,
-      (_) => _periodicHealthCheck(),
-    );
+    _scheduleNextHealthCheck();
+  }
+
+  void _scheduleNextHealthCheck() {
+    if (!mounted) return;
+    // When offline, use exponential backoff (1 s → 2 s → 4 s → 8 s).
+    // Failures beyond the last backoff index continue at the maximum delay.
+    final delay = _isServerOnline
+        ? AppDurations.healthCheckNormal
+        : Duration(
+            seconds: _backoffDelays[
+                _healthCheckFailures.clamp(0, _backoffDelays.length - 1)],
+          );
+    _healthTimer = Timer(delay, _performHealthCheckAndReschedule);
+  }
+
+  Future<void> _performHealthCheckAndReschedule() async {
+    await _periodicHealthCheck();
+    _scheduleNextHealthCheck();
   }
 
   Future<void> _periodicHealthCheck() async {
     if (!mounted) return;
     final isOnline = await _aiService.checkHealth();
+    if (!mounted) return;
+
+    if (isOnline) {
+      _lastHealthyTime = DateTime.now();
+      _healthCheckFailures = 0;
+      _wentOfflineAt = null;
+      _offlineWarningShown = false;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _lastHealthyKey,
+        _lastHealthyTime!.toIso8601String(),
+      );
+    } else {
+      _healthCheckFailures++;
+      _wentOfflineAt ??= DateTime.now();
+
+      // Warn the user once per offline episode if unreachable for > 5 minutes.
+      if (!_offlineWarningShown) {
+        final downFor = DateTime.now().difference(_wentOfflineAt!);
+        if (downFor >= AppDurations.offlineWarning && mounted) {
+          _offlineWarningShown = true;
+          final minutes = downFor.inMinutes;
+          ScaffoldMessenger.of(context)
+            ..hideCurrentSnackBar()
+            ..showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Server has been unreachable for $minutes min. '
+                  'Please check llama-server in Termux.',
+                ),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 6),
+              ),
+            );
+        }
+      }
+    }
+
     if (mounted && isOnline != _isServerOnline) {
       setState(() => _isServerOnline = isOnline);
     }
@@ -151,12 +239,16 @@ class _ChatScreenState extends State<ChatScreen> {
     final isOnline = await _aiService.checkHealth();
     if (mounted) {
       if (isOnline) {
+        _lastHealthyTime = DateTime.now();
+        _healthCheckFailures = 0;
+        _wentOfflineAt = null;
+        _offlineWarningShown = false;
         setState(() {
           _isServerOnline = true;
           _isChecking = false;
         });
         _inactivityService.resetTimer();
-        _startPeriodicHealthChecks();
+        _startHealthChecks();
       } else {
         setState(() {
           _isServerOnline = false;
@@ -202,6 +294,7 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {
           _isLoading = false;
           _streamingContent = null;
+          _isToolCalling = false;
         });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -214,11 +307,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   /// Builds the list of messages to send to the API.
-  ///
-  /// Prepends a base system prompt, relevant memory context, and RAG context,
-  /// then applies a sliding context window over the stored conversation.
   Future<List<Message>> _buildApiMessages(String userQuery) async {
-    // Base system prompt.
     final context = <Message>[
       const Message(role: 'system', content: kDefaultSystemPrompt),
     ];
@@ -232,7 +321,6 @@ class _ChatScreenState extends State<ChatScreen> {
       context.add(Message(role: 'system', content: ragContext));
     }
 
-    // Sliding window: keep the last [contextWindow] non-system messages.
     final history = _messages.where((m) => m.role != 'system').toList();
     final windowed = history.length > _settings.contextWindow
         ? history.sublist(history.length - _settings.contextWindow)
@@ -250,7 +338,6 @@ class _ChatScreenState extends State<ChatScreen> {
       final contentBuffer = StringBuffer();
       List<ToolCall>? pendingToolCalls;
 
-      // Stream the next turn from the model.
       await for (final event in _aiService.streamMessage(
         apiMessages,
         tools: ToolService.toolSchemas,
@@ -261,16 +348,21 @@ class _ChatScreenState extends State<ChatScreen> {
         if (event is AiTextToken) {
           contentBuffer.write(event.token);
           if (mounted) {
-            setState(() => _streamingContent = contentBuffer.toString());
+            setState(() {
+              _streamingContent = contentBuffer.toString();
+              _isToolCalling = false;
+            });
             _scrollToBottom();
           }
         } else if (event is AiToolCallsEvent) {
           pendingToolCalls = event.toolCalls;
+          if (mounted) {
+            setState(() => _isToolCalling = true);
+          }
         }
       }
 
       if (pendingToolCalls == null) {
-        // Plain text reply — finalise the streaming bubble.
         final assistantMessage = Message(
           role: 'assistant',
           content: contentBuffer.toString(),
@@ -281,6 +373,7 @@ class _ChatScreenState extends State<ChatScreen> {
             _uiItems.add(_UiItem.message(assistantMessage));
             _streamingContent = null;
             _isLoading = false;
+            _isToolCalling = false;
           });
           await _storageService.saveHistory(_messages);
           _scrollToBottom();
@@ -288,7 +381,6 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      // Tool call(s) requested — hide the streaming bubble and process them.
       if (mounted) {
         setState(() => _streamingContent = null);
       }
@@ -328,11 +420,11 @@ class _ChatScreenState extends State<ChatScreen> {
       round++;
     }
 
-    // Exceeded max tool-call rounds.
     if (mounted) {
       setState(() {
         _streamingContent = null;
         _isLoading = false;
+        _isToolCalling = false;
       });
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -340,6 +432,192 @@ class _ChatScreenState extends State<ChatScreen> {
               Text('Tool call limit reached. Try rephrasing your message.'),
         ),
       );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Message actions: delete, edit, regenerate
+  //
+  // NOTE: These methods use Dart's [identical] for object-reference equality
+  // because messages added to [_messages] and [_uiItems] within a single
+  // session always share the same instance. The lists are rebuilt from scratch
+  // in [_initialize] so there is no risk of stale references from a previous
+  // session.
+  // -------------------------------------------------------------------------
+
+  void _handleDeleteMessage(Message message) {
+    setState(() {
+      _messages.removeWhere((m) => identical(m, message));
+      _uiItems.removeWhere((item) => identical(item.message, message));
+    });
+    _storageService.saveHistory(_messages);
+  }
+
+  Future<void> _handleEditMessage(
+    Message message,
+    String newContent,
+  ) async {
+    final msgIndex =
+        _messages.indexWhere((m) => identical(m, message));
+    final uiIndex =
+        _uiItems.indexWhere((item) => identical(item.message, message));
+    if (msgIndex < 0 || uiIndex < 0) return;
+
+    final editedMessage = message.copyWith(
+      content: newContent,
+      isEdited: true,
+    );
+
+    // Remove the original message and everything after it. Do NOT add
+    // editedMessage to _messages yet – _buildApiMessages reads from _messages
+    // and editedMessage is added explicitly to apiMessages below (same pattern
+    // as _sendMessage).
+    setState(() {
+      _messages.removeRange(msgIndex, _messages.length);
+      _uiItems.removeRange(uiIndex, _uiItems.length);
+      _uiItems.add(_UiItem.message(editedMessage));
+      _isLoading = true;
+    });
+    _inactivityService.resetTimer();
+
+    final apiMessages = await _buildApiMessages(newContent);
+    apiMessages.add(editedMessage);
+
+    // Persist the edited message now that the API context is built.
+    setState(() => _messages.add(editedMessage));
+    _scrollToBottom();
+
+    try {
+      await _runConversationLoop(apiMessages);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _streamingContent = null;
+          _isToolCalling = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _handleRegenerateMessage(Message assistantMessage) async {
+    final uiIndex = _uiItems
+        .indexWhere((item) => identical(item.message, assistantMessage));
+    // Walk back through _messages to find the user message that triggered
+    // this assistant response.
+    final msgIndex =
+        _messages.indexWhere((m) => identical(m, assistantMessage));
+    if (msgIndex < 0 || uiIndex < 0) return;
+
+    int userMsgIndex = msgIndex - 1;
+    while (userMsgIndex >= 0 && _messages[userMsgIndex].role != 'user') {
+      userMsgIndex--;
+    }
+    if (userMsgIndex < 0) return;
+
+    final userMessage = _messages[userMsgIndex];
+    final userUiIndex =
+        _uiItems.indexWhere((item) => identical(item.message, userMessage));
+
+    // Remove tool results AND the assistant message from _messages (everything
+    // after the user message that prompted this response).
+    setState(() {
+      _messages.removeRange(userMsgIndex + 1, _messages.length);
+      if (userUiIndex >= 0) {
+        _uiItems.removeRange(userUiIndex + 1, _uiItems.length);
+      }
+      _isLoading = true;
+    });
+    _inactivityService.resetTimer();
+
+    // userMessage is still the last item in _messages, so _buildApiMessages
+    // already includes it in the windowed history. No need to add it again.
+    final apiMessages = await _buildApiMessages(userMessage.content);
+    _scrollToBottom();
+
+    try {
+      await _runConversationLoop(apiMessages);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _streamingContent = null;
+          _isToolCalling = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Export
+  // -------------------------------------------------------------------------
+
+  Future<void> _showExportDialog() async {
+    final format = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Export conversation'),
+        content: const Text('Choose export format:'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop('json'),
+            child: const Text('JSON'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop('md'),
+            child: const Text('Markdown'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop('txt'),
+            child: const Text('Plain text'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+    if (format == null || !mounted) return;
+
+    try {
+      late String content;
+      switch (format) {
+        case 'json':
+          content = _exportService.toJson(_messages);
+        case 'md':
+          content = _exportService.toMarkdown(_messages);
+        default:
+          content = _exportService.toText(_messages);
+      }
+      final filename = _exportService.timestampedFilename(format);
+      final file = await _exportService.saveToDocuments(content, filename);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Saved to ${file.path}')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Export failed: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
     }
   }
 
@@ -352,7 +630,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
           _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
+          duration: AppDurations.animationShort,
           curve: Curves.easeOut,
         );
       }
@@ -396,9 +674,19 @@ class _ChatScreenState extends State<ChatScreen> {
       MaterialPageRoute<bool>(builder: (_) => const SettingsScreen()),
     );
     if (changed == true && mounted) {
-      // Reload settings and recreate AiService with potentially new server URL.
-      _settings = await _settingsService.loadAll();
-      _aiService = AiService(baseUrl: _settings.serverUrl);
+      final newSettings = await _settingsService.loadAll();
+      // Only recreate AiService if the server URL actually changed.
+      if (newSettings.serverUrl != _settings.serverUrl) {
+        _aiService = AiService(baseUrl: newSettings.serverUrl);
+        // Keep InactivityService in sync with the new AiService instance.
+        _inactivityService.dispose();
+        _inactivityService = InactivityService(
+          aiService: _aiService,
+          onTimeout: _onInactivityTimeout,
+        );
+        _inactivityService.resetTimer();
+      }
+      _settings = newSettings;
     }
   }
 
@@ -433,7 +721,8 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     if (!_isServerOnline) {
-      return OfflineScreen(onRetry: _initialize);
+      final offlineMessage = _buildOfflineMessage();
+      return OfflineScreen(onRetry: _initialize, message: offlineMessage);
     }
 
     return Scaffold(
@@ -454,8 +743,8 @@ class _ChatScreenState extends State<ChatScreen> {
                   height: 10,
                   decoration: BoxDecoration(
                     color: _isServerOnline
-                        ? Colors.greenAccent
-                        : Colors.redAccent,
+                        ? AppColors.onlineIndicator
+                        : AppColors.offlineIndicator,
                     shape: BoxShape.circle,
                   ),
                 ),
@@ -464,6 +753,11 @@ class _ChatScreenState extends State<ChatScreen> {
           ],
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.ios_share_rounded),
+            tooltip: 'Export conversation',
+            onPressed: _uiItems.isEmpty ? null : _showExportDialog,
+          ),
           IconButton(
             icon: const Icon(Icons.description_rounded),
             tooltip: 'Documents',
@@ -507,13 +801,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.symmetric(vertical: 8),
-                    itemCount:
-                        _uiItems.length +
+                    itemCount: _uiItems.length +
                         (_isLoading || _streamingContent != null ? 1 : 0),
                     itemBuilder: (context, index) {
                       if (index == _uiItems.length) {
-                        // Show streamed content if tokens are arriving;
-                        // otherwise show the animated typing indicator.
                         if (_streamingContent != null) {
                           return ChatBubble(
                             message: Message(
@@ -522,7 +813,9 @@ class _ChatScreenState extends State<ChatScreen> {
                             ),
                           );
                         }
-                        return const TypingIndicator();
+                        return TypingIndicator(
+                          isToolCalling: _isToolCalling,
+                        );
                       }
                       final item = _uiItems[index];
                       if (item.isToolCall) {
@@ -531,7 +824,17 @@ class _ChatScreenState extends State<ChatScreen> {
                           description: item.description!,
                         );
                       }
-                      return ChatBubble(message: item.message!);
+                      final msg = item.message!;
+                      return ChatBubble(
+                        message: msg,
+                        onDelete: () => _handleDeleteMessage(msg),
+                        onEdit: msg.role == 'user'
+                            ? (text) => _handleEditMessage(msg, text)
+                            : null,
+                        onRegenerate: msg.role == 'assistant'
+                            ? () => _handleRegenerateMessage(msg)
+                            : null,
+                      );
                     },
                   ),
           ),
@@ -541,12 +844,31 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  /// Builds an informative offline message that includes how long the server
+  /// has been unreachable when the duration is notable.
+  String? _buildOfflineMessage() {
+    if (_wentOfflineAt == null) return null;
+    final downFor = DateTime.now().difference(_wentOfflineAt!);
+    if (downFor.inMinutes < 1) return null;
+    final lastSeenStr = _lastHealthyTime != null
+        ? 'Last seen: ${_formatTime(_lastHealthyTime!)}'
+        : '';
+    return 'Server has been offline for ${downFor.inMinutes} min. '
+        '$lastSeenStr\n\n'
+        'Please open Termux and start the server manually, '
+        'or wait for Termux:Boot to start it automatically.';
+  }
+
+  String _formatTime(DateTime dt) =>
+      '${dt.hour.toString().padLeft(2, '0')}:'
+      '${dt.minute.toString().padLeft(2, '0')}';
+
   Widget _buildInputArea() {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: const BoxDecoration(
-        color: Color(0xFF1E1E1E),
-        border: Border(top: BorderSide(color: Color(0xFF333333))),
+        color: AppColors.surface,
+        border: Border(top: BorderSide(color: AppColors.border)),
       ),
       child: SafeArea(
         top: false,

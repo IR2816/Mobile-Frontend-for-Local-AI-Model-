@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/message.dart';
@@ -9,6 +10,9 @@ class StorageService {
 
   /// Maximum number of messages retained in storage.
   static const int _maxMessages = 500;
+
+  /// Minimum number of messages to retain – never trim below this count.
+  static const int _minMessages = 50;
 
   /// Maximum JSON byte size for stored history (100 MB).
   static const int _maxJsonBytes = 100 * 1024 * 1024;
@@ -22,12 +26,20 @@ class StorageService {
         : messages;
 
     // Further trim if the JSON representation exceeds [_maxJsonBytes].
+    // Remove 25 % of messages per iteration for faster convergence, but never
+    // go below [_minMessages].
     var json = jsonEncode(trimmed.map((m) => m.toJson()).toList());
-    while (json.length > _maxJsonBytes && trimmed.isNotEmpty) {
-      // Remove the oldest 10 % of messages at a time.
-      final removeCount = (trimmed.length * 0.1).ceil().clamp(1, trimmed.length);
+    while (json.length > _maxJsonBytes && trimmed.length > _minMessages) {
+      final removable = trimmed.length - _minMessages;
+      final removeCount =
+          ((trimmed.length * 0.25).ceil()).clamp(1, removable);
+      final before = trimmed.length;
       trimmed = trimmed.sublist(removeCount);
       json = jsonEncode(trimmed.map((m) => m.toJson()).toList());
+      debugPrint(
+        '[StorageService] Trimmed ${before - trimmed.length} messages '
+        '(${trimmed.length} remaining, JSON=${json.length}b).',
+      );
     }
 
     await prefs.setString(_historyKey, json);
