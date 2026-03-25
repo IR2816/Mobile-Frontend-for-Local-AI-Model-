@@ -28,7 +28,7 @@ jobs:
       - name: Download Gradle wrapper jar
         run: |
           curl -fsSL \
-            "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar" \
+            "https://github.com/gradle/gradle/raw/v8.9.0/gradle/wrapper/gradle-wrapper.jar" \
             -o android/gradle/wrapper/gradle-wrapper.jar
           chmod +x android/gradlew
 

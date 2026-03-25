@@ -25,6 +25,14 @@ class _OfflineScreenState extends State<OfflineScreen> {
     setState(() => _isRetrying = false);
     if (isOnline) {
       widget.onRetry();
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Server is still offline. Please check Termux.'),
+          backgroundColor: Colors.redAccent,
+          duration: Duration(seconds: 4),
+        ),
+      );
     }
   }
 

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../models/message.dart';
@@ -245,6 +246,15 @@ class AiService {
           for (final tc in rawToolCalls) {
             final tcMap = tc as Map<String, dynamic>;
             final index = tcMap['index'] as int? ?? 0;
+
+            // Safeguard: refuse to accumulate more than 10 concurrent tool calls.
+            if (!toolCallBuffers.containsKey(index) &&
+                toolCallBuffers.length >= 10) {
+              throw Exception(
+                'Too many concurrent tool calls detected (limit: 10).',
+              );
+            }
+
             final buf = toolCallBuffers.putIfAbsent(
               index,
               _ToolCallBuffer.new,
@@ -255,24 +265,38 @@ class AiService {
               if (fn['name'] != null) buf.name = fn['name'] as String;
               if (fn['arguments'] != null) {
                 buf.arguments += fn['arguments'] as String;
+                debugPrint(
+                  '[AiService] Tool call fragment: index=$index '
+                  'name=${buf.name} args_so_far=${buf.arguments.length}b',
+                );
               }
             }
           }
         }
       }
 
-      // If tool calls were accumulated, emit them as a single event.
+      // If tool calls were accumulated, validate JSON and emit as a single event.
       if (toolCallBuffers.isNotEmpty) {
-        final toolCalls = toolCallBuffers.values
-            .map(
-              (buf) => ToolCall(
-                id: buf.id,
-                name: buf.name,
-                argumentsJson: buf.arguments,
-              ),
-            )
-            .toList();
-        yield AiToolCallsEvent(toolCalls);
+        final toolCalls = <ToolCall>[];
+        for (final buf in toolCallBuffers.values) {
+          // Validate that accumulated arguments are valid JSON.
+          final args = buf.arguments.isEmpty ? '{}' : buf.arguments;
+          try {
+            jsonDecode(args);
+          } on FormatException {
+            debugPrint(
+              '[AiService] Tool call "${buf.name}" has invalid JSON arguments '
+              '– skipping. Raw: $args',
+            );
+            continue;
+          }
+          toolCalls.add(
+            ToolCall(id: buf.id, name: buf.name, argumentsJson: args),
+          );
+        }
+        if (toolCalls.isNotEmpty) {
+          yield AiToolCallsEvent(toolCalls);
+        }
       }
     } on SocketException catch (e) {
       throw Exception('Network error: ${e.message}');
