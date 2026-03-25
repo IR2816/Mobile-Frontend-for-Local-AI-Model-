@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/message.dart';
+import '../models/message_status.dart';
 import '../services/ai_service.dart';
 import '../services/export_service.dart';
 import '../services/inactivity_service.dart';
@@ -272,7 +273,12 @@ class _ChatScreenState extends State<ChatScreen> {
     final text = _textController.text.trim();
     if (text.isEmpty || _isLoading) return;
 
-    final userMessage = Message(role: 'user', content: text);
+    final userMessage = Message(
+      role: 'user',
+      content: text,
+      timestamp: DateTime.now(),
+      status: MessageStatus.sent,
+    );
     _textController.clear();
     _inactivityService.resetTimer();
 
@@ -366,6 +372,8 @@ class _ChatScreenState extends State<ChatScreen> {
         final assistantMessage = Message(
           role: 'assistant',
           content: contentBuffer.toString(),
+          timestamp: DateTime.now(),
+          status: MessageStatus.delivered,
         );
         if (mounted) {
           setState(() {
@@ -466,6 +474,8 @@ class _ChatScreenState extends State<ChatScreen> {
     final editedMessage = message.copyWith(
       content: newContent,
       isEdited: true,
+      originalContent: message.originalContent ?? message.content,
+      status: MessageStatus.sent,
     );
 
     // Remove the original message and everything after it. Do NOT add
