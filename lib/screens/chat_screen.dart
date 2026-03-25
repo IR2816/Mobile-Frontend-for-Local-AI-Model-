@@ -3,9 +3,15 @@ import 'package:flutter/material.dart';
 import '../models/message.dart';
 import '../services/ai_service.dart';
 import '../services/inactivity_service.dart';
+import '../services/memory_service.dart';
+import '../services/rag_service.dart';
 import '../services/storage_service.dart';
+import '../services/tool_service.dart';
 import '../widgets/chat_bubble.dart';
+import '../widgets/tool_call_bubble.dart';
 import '../widgets/typing_indicator.dart';
+import 'documents_screen.dart';
+import 'memory_screen.dart';
 import 'offline_screen.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -18,12 +24,20 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final AiService _aiService = AiService();
   final StorageService _storageService = StorageService();
+  final MemoryService _memoryService = MemoryService();
+  final RagService _ragService = RagService();
+  final ToolService _toolService = ToolService();
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
 
   late final InactivityService _inactivityService;
 
+  /// The full conversation history (stored/loaded via StorageService).
   List<Message> _messages = [];
+
+  /// UI-only items for rendering: messages + tool-call indicators.
+  final List<_UiItem> _uiItems = [];
+
   bool _isLoading = false;
   bool _isServerOnline = false;
   bool _isChecking = true;
@@ -56,6 +70,12 @@ class _ChatScreenState extends State<ChatScreen> {
           _isServerOnline = true;
           _isChecking = false;
           _messages = history;
+          _uiItems.clear();
+          for (final m in history) {
+            if (m.role != 'system' && m.role != 'tool') {
+              _uiItems.add(_UiItem.message(m));
+            }
+          }
         });
         _inactivityService.resetTimer();
         _scrollToBottom();
@@ -100,25 +120,22 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty || _isLoading) return;
 
     final userMessage = Message(role: 'user', content: text);
-    setState(() {
-      _messages.add(userMessage);
-      _isLoading = true;
-    });
     _textController.clear();
     _inactivityService.resetTimer();
+
+    // Build the API conversation: system context + history + new user message.
+    final apiMessages = await _buildApiMessages(text);
+    apiMessages.add(userMessage);
+
+    setState(() {
+      _messages.add(userMessage);
+      _uiItems.add(_UiItem.message(userMessage));
+      _isLoading = true;
+    });
     _scrollToBottom();
 
     try {
-      final reply = await _aiService.sendMessage(_messages);
-      final assistantMessage = Message(role: 'assistant', content: reply);
-      if (mounted) {
-        setState(() {
-          _messages.add(assistantMessage);
-          _isLoading = false;
-        });
-        await _storageService.saveHistory(_messages);
-        _scrollToBottom();
-      }
+      await _runConversationLoop(apiMessages);
     } catch (e) {
       if (mounted) {
         setState(() => _isLoading = false);
@@ -129,6 +146,106 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         );
       }
+    }
+  }
+
+  /// Builds the list of messages to send to the API, prepending relevant
+  /// memory and RAG context as system messages.
+  Future<List<Message>> _buildApiMessages(String userQuery) async {
+    final context = <Message>[];
+
+    final memoryMsg =
+        await _memoryService.buildMemoryContextMessage(userQuery);
+    if (memoryMsg != null) context.add(memoryMsg);
+
+    final ragContext = await _ragService.search(userQuery);
+    if (ragContext != null) {
+      context.add(Message(role: 'system', content: ragContext));
+    }
+
+    // Include the persisted conversation history. System messages are excluded
+    // because fresh context is injected above on every turn. Tool messages
+    // from previous turns ARE included — they form part of the function-calling
+    // context that the model needs to reason about past tool results.
+    final history =
+        _messages.where((m) => m.role != 'system').toList();
+
+    return [...context, ...history];
+  }
+
+  /// Runs the function-calling loop until the model returns a plain-text reply.
+  Future<void> _runConversationLoop(List<Message> apiMessages) async {
+    const int maxToolRounds = 5;
+    int round = 0;
+
+    while (round < maxToolRounds) {
+      final response = await _aiService.sendMessage(
+        apiMessages,
+        tools: ToolService.toolSchemas,
+      );
+
+      if (!response.isToolCall) {
+        // Plain text reply — we're done.
+        final assistantMessage =
+            Message(role: 'assistant', content: response.text ?? '');
+        if (mounted) {
+          setState(() {
+            _messages.add(assistantMessage);
+            _uiItems.add(_UiItem.message(assistantMessage));
+            _isLoading = false;
+          });
+          await _storageService.saveHistory(_messages);
+          _scrollToBottom();
+        }
+        return;
+      }
+
+      // Tool call(s) requested.
+      for (final toolCall in response.toolCalls!) {
+        final description =
+            toolCallDescription(toolCall.name, toolCall.argumentsJson);
+
+        if (mounted) {
+          setState(() {
+            _uiItems.add(
+              _UiItem.toolCall(
+                toolName: toolCall.name,
+                description: description,
+              ),
+            );
+          });
+          _scrollToBottom();
+        }
+
+        // Execute the tool.
+        final result = await _toolService.execute(
+          toolCallId: toolCall.id,
+          toolName: toolCall.name,
+          argumentsJson: toolCall.argumentsJson,
+        );
+
+        // Append the tool result as a 'tool' role message.
+        final toolResultMessage = Message(
+          role: 'tool',
+          content: result.result,
+          toolCallId: result.toolCallId,
+          toolName: result.toolName,
+        );
+        apiMessages.add(toolResultMessage);
+        _messages.add(toolResultMessage);
+      }
+
+      round++;
+    }
+
+    // Exceeded max rounds — send whatever the model last produced as text.
+    if (mounted) {
+      setState(() => _isLoading = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Tool call limit reached. Try rephrasing your message.'),
+        ),
+      );
     }
   }
 
@@ -168,7 +285,10 @@ class _ChatScreenState extends State<ChatScreen> {
     if (confirmed == true) {
       await _storageService.clearHistory();
       if (mounted) {
-        setState(() => _messages = []);
+        setState(() {
+          _messages = [];
+          _uiItems.clear();
+        });
       }
     }
   }
@@ -212,7 +332,8 @@ class _ChatScreenState extends State<ChatScreen> {
             GestureDetector(
               onTap: _retryHealthCheck,
               child: Semantics(
-                label: 'Server status: ${_isServerOnline ? 'online' : 'offline'}. Tap to retry health check.',
+                label:
+                    'Server status: ${_isServerOnline ? 'online' : 'offline'}. Tap to retry health check.',
                 button: true,
                 child: Container(
                   width: 10,
@@ -230,8 +351,26 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.description_rounded),
+            tooltip: 'Documents',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const DocumentsScreen(),
+              ),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.psychology_rounded),
+            tooltip: 'Memory',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const MemoryScreen(),
+              ),
+            ),
+          ),
+          IconButton(
             icon: const Icon(Icons.delete_outline_rounded),
-            onPressed: _messages.isEmpty ? null : _confirmClearChat,
+            onPressed: _uiItems.isEmpty ? null : _confirmClearChat,
             tooltip: 'Clear chat',
           ),
         ],
@@ -239,7 +378,7 @@ class _ChatScreenState extends State<ChatScreen> {
       body: Column(
         children: [
           Expanded(
-            child: _messages.isEmpty
+            child: _uiItems.isEmpty
                 ? const Center(
                     child: Text(
                       'Start a conversation…',
@@ -249,12 +388,19 @@ class _ChatScreenState extends State<ChatScreen> {
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.symmetric(vertical: 8),
-                    itemCount: _messages.length + (_isLoading ? 1 : 0),
+                    itemCount: _uiItems.length + (_isLoading ? 1 : 0),
                     itemBuilder: (context, index) {
-                      if (index == _messages.length) {
+                      if (index == _uiItems.length) {
                         return const TypingIndicator();
                       }
-                      return ChatBubble(message: _messages[index]);
+                      final item = _uiItems[index];
+                      if (item.isToolCall) {
+                        return ToolCallBubble(
+                          toolName: item.toolName!,
+                          description: item.description!,
+                        );
+                      }
+                      return ChatBubble(message: item.message!);
                     },
                   ),
           ),
@@ -304,4 +450,22 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
     );
   }
+}
+
+/// Discriminated union for items in the chat UI list.
+class _UiItem {
+  final Message? message;
+  final String? toolName;
+  final String? description;
+
+  const _UiItem._({this.message, this.toolName, this.description});
+
+  factory _UiItem.message(Message m) => _UiItem._(message: m);
+  factory _UiItem.toolCall({
+    required String toolName,
+    required String description,
+  }) =>
+      _UiItem._(toolName: toolName, description: description);
+
+  bool get isToolCall => toolName != null;
 }
