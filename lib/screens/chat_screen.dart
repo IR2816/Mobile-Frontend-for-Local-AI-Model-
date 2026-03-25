@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../models/message.dart';
@@ -5,6 +7,7 @@ import '../services/ai_service.dart';
 import '../services/inactivity_service.dart';
 import '../services/memory_service.dart';
 import '../services/rag_service.dart';
+import '../services/settings_service.dart';
 import '../services/storage_service.dart';
 import '../services/tool_service.dart';
 import '../widgets/chat_bubble.dart';
@@ -13,6 +16,7 @@ import '../widgets/typing_indicator.dart';
 import 'documents_screen.dart';
 import 'memory_screen.dart';
 import 'offline_screen.dart';
+import 'settings_screen.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -22,15 +26,25 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final AiService _aiService = AiService();
+  static const Duration _healthCheckInterval = Duration(seconds: 30);
   final StorageService _storageService = StorageService();
   final MemoryService _memoryService = MemoryService();
   final RagService _ragService = RagService();
   final ToolService _toolService = ToolService();
+  final SettingsService _settingsService = SettingsService();
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
 
-  late final InactivityService _inactivityService;
+  late AiService _aiService;
+  late InactivityService _inactivityService;
+
+  AppSettings _settings = const AppSettings(
+    serverUrl: SettingsService.defaultServerUrl,
+    temperature: SettingsService.defaultTemperature,
+    topP: SettingsService.defaultTopP,
+    maxTokens: SettingsService.defaultMaxTokens,
+    contextWindow: SettingsService.defaultContextWindow,
+  );
 
   /// The full conversation history (stored/loaded via StorageService).
   List<Message> _messages = [];
@@ -42,9 +56,16 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isServerOnline = false;
   bool _isChecking = true;
 
+  /// Streamed assistant response being built token-by-token.
+  /// Non-null only while a streaming text response is in progress.
+  String? _streamingContent;
+
+  Timer? _healthTimer;
+
   @override
   void initState() {
     super.initState();
+    _aiService = AiService(baseUrl: SettingsService.defaultServerUrl);
     _inactivityService = InactivityService(
       aiService: _aiService,
       onTimeout: _onInactivityTimeout,
@@ -54,14 +75,32 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    _healthTimer?.cancel();
     _inactivityService.dispose();
     _textController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
+  // -------------------------------------------------------------------------
+  // Initialisation & health
+  // -------------------------------------------------------------------------
+
   Future<void> _initialize() async {
     setState(() => _isChecking = true);
+
+    // Load settings first so they're available before anything else.
+    _settings = await _settingsService.loadAll();
+    _aiService = AiService(baseUrl: _settings.serverUrl);
+
+    // Recreate InactivityService so it references the correctly-configured
+    // AiService (in case the server URL has changed since last run).
+    _inactivityService.dispose();
+    _inactivityService = InactivityService(
+      aiService: _aiService,
+      onTimeout: _onInactivityTimeout,
+    );
+
     final isOnline = await _aiService.checkHealth();
     if (isOnline) {
       final history = await _storageService.loadHistory();
@@ -78,6 +117,7 @@ class _ChatScreenState extends State<ChatScreen> {
           }
         });
         _inactivityService.resetTimer();
+        _startPeriodicHealthChecks();
         _scrollToBottom();
       }
     } else {
@@ -87,6 +127,22 @@ class _ChatScreenState extends State<ChatScreen> {
           _isChecking = false;
         });
       }
+    }
+  }
+
+  void _startPeriodicHealthChecks() {
+    _healthTimer?.cancel();
+    _healthTimer = Timer.periodic(
+      _healthCheckInterval,
+      (_) => _periodicHealthCheck(),
+    );
+  }
+
+  Future<void> _periodicHealthCheck() async {
+    if (!mounted) return;
+    final isOnline = await _aiService.checkHealth();
+    if (mounted && isOnline != _isServerOnline) {
+      setState(() => _isServerOnline = isOnline);
     }
   }
 
@@ -100,6 +156,7 @@ class _ChatScreenState extends State<ChatScreen> {
           _isChecking = false;
         });
         _inactivityService.resetTimer();
+        _startPeriodicHealthChecks();
       } else {
         setState(() {
           _isServerOnline = false;
@@ -115,6 +172,10 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Message sending
+  // -------------------------------------------------------------------------
+
   Future<void> _sendMessage() async {
     final text = _textController.text.trim();
     if (text.isEmpty || _isLoading) return;
@@ -123,7 +184,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _textController.clear();
     _inactivityService.resetTimer();
 
-    // Build the API conversation: system context + history + new user message.
+    // Build context window: system prompts + last N messages + new user msg.
     final apiMessages = await _buildApiMessages(text);
     apiMessages.add(userMessage);
 
@@ -138,7 +199,10 @@ class _ChatScreenState extends State<ChatScreen> {
       await _runConversationLoop(apiMessages);
     } catch (e) {
       if (mounted) {
-        setState(() => _isLoading = false);
+        setState(() {
+          _isLoading = false;
+          _streamingContent = null;
+        });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Error: $e'),
@@ -149,10 +213,15 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// Builds the list of messages to send to the API, prepending relevant
-  /// memory and RAG context as system messages.
+  /// Builds the list of messages to send to the API.
+  ///
+  /// Prepends a base system prompt, relevant memory context, and RAG context,
+  /// then applies a sliding context window over the stored conversation.
   Future<List<Message>> _buildApiMessages(String userQuery) async {
-    final context = <Message>[];
+    // Base system prompt.
+    final context = <Message>[
+      const Message(role: 'system', content: kDefaultSystemPrompt),
+    ];
 
     final memoryMsg =
         await _memoryService.buildMemoryContextMessage(userQuery);
@@ -163,35 +232,54 @@ class _ChatScreenState extends State<ChatScreen> {
       context.add(Message(role: 'system', content: ragContext));
     }
 
-    // Include the persisted conversation history. System messages are excluded
-    // because fresh context is injected above on every turn. Tool messages
-    // from previous turns ARE included — they form part of the function-calling
-    // context that the model needs to reason about past tool results.
-    final history =
-        _messages.where((m) => m.role != 'system').toList();
+    // Sliding window: keep the last [contextWindow] non-system messages.
+    final history = _messages.where((m) => m.role != 'system').toList();
+    final windowed = history.length > _settings.contextWindow
+        ? history.sublist(history.length - _settings.contextWindow)
+        : history;
 
-    return [...context, ...history];
+    return [...context, ...windowed];
   }
 
-  /// Runs the function-calling loop until the model returns a plain-text reply.
+  /// Runs the streaming function-calling loop until the model returns text.
   Future<void> _runConversationLoop(List<Message> apiMessages) async {
     const int maxToolRounds = 5;
     int round = 0;
 
     while (round < maxToolRounds) {
-      final response = await _aiService.sendMessage(
+      final contentBuffer = StringBuffer();
+      List<ToolCall>? pendingToolCalls;
+
+      // Stream the next turn from the model.
+      await for (final event in _aiService.streamMessage(
         apiMessages,
         tools: ToolService.toolSchemas,
-      );
+        temperature: _settings.temperature,
+        maxTokens: _settings.maxTokens,
+        topP: _settings.topP,
+      )) {
+        if (event is AiTextToken) {
+          contentBuffer.write(event.token);
+          if (mounted) {
+            setState(() => _streamingContent = contentBuffer.toString());
+            _scrollToBottom();
+          }
+        } else if (event is AiToolCallsEvent) {
+          pendingToolCalls = event.toolCalls;
+        }
+      }
 
-      if (!response.isToolCall) {
-        // Plain text reply — we're done.
-        final assistantMessage =
-            Message(role: 'assistant', content: response.text ?? '');
+      if (pendingToolCalls == null) {
+        // Plain text reply — finalise the streaming bubble.
+        final assistantMessage = Message(
+          role: 'assistant',
+          content: contentBuffer.toString(),
+        );
         if (mounted) {
           setState(() {
             _messages.add(assistantMessage);
             _uiItems.add(_UiItem.message(assistantMessage));
+            _streamingContent = null;
             _isLoading = false;
           });
           await _storageService.saveHistory(_messages);
@@ -200,8 +288,12 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      // Tool call(s) requested.
-      for (final toolCall in response.toolCalls!) {
+      // Tool call(s) requested — hide the streaming bubble and process them.
+      if (mounted) {
+        setState(() => _streamingContent = null);
+      }
+
+      for (final toolCall in pendingToolCalls) {
         final description =
             toolCallDescription(toolCall.name, toolCall.argumentsJson);
 
@@ -217,14 +309,12 @@ class _ChatScreenState extends State<ChatScreen> {
           _scrollToBottom();
         }
 
-        // Execute the tool.
         final result = await _toolService.execute(
           toolCallId: toolCall.id,
           toolName: toolCall.name,
           argumentsJson: toolCall.argumentsJson,
         );
 
-        // Append the tool result as a 'tool' role message.
         final toolResultMessage = Message(
           role: 'tool',
           content: result.result,
@@ -238,16 +328,24 @@ class _ChatScreenState extends State<ChatScreen> {
       round++;
     }
 
-    // Exceeded max rounds — send whatever the model last produced as text.
+    // Exceeded max tool-call rounds.
     if (mounted) {
-      setState(() => _isLoading = false);
+      setState(() {
+        _streamingContent = null;
+        _isLoading = false;
+      });
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Tool call limit reached. Try rephrasing your message.'),
+          content:
+              Text('Tool call limit reached. Try rephrasing your message.'),
         ),
       );
     }
   }
+
+  // -------------------------------------------------------------------------
+  // UI helpers
+  // -------------------------------------------------------------------------
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -293,6 +391,17 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Future<void> _openSettings() async {
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(builder: (_) => const SettingsScreen()),
+    );
+    if (changed == true && mounted) {
+      // Reload settings and recreate AiService with potentially new server URL.
+      _settings = await _settingsService.loadAll();
+      _aiService = AiService(baseUrl: _settings.serverUrl);
+    }
+  }
+
   void _onInactivityTimeout(String message) {
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
@@ -310,6 +419,10 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
     );
   }
+
+  // -------------------------------------------------------------------------
+  // Build
+  // -------------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
@@ -333,7 +446,8 @@ class _ChatScreenState extends State<ChatScreen> {
               onTap: _retryHealthCheck,
               child: Semantics(
                 label:
-                    'Server status: ${_isServerOnline ? 'online' : 'offline'}. Tap to retry health check.',
+                    'Server status: ${_isServerOnline ? 'online' : 'offline'}. '
+                    'Tap to retry health check.',
                 button: true,
                 child: Container(
                   width: 10,
@@ -369,6 +483,11 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
           IconButton(
+            icon: const Icon(Icons.settings_rounded),
+            tooltip: 'Settings',
+            onPressed: _openSettings,
+          ),
+          IconButton(
             icon: const Icon(Icons.delete_outline_rounded),
             onPressed: _uiItems.isEmpty ? null : _confirmClearChat,
             tooltip: 'Clear chat',
@@ -378,7 +497,7 @@ class _ChatScreenState extends State<ChatScreen> {
       body: Column(
         children: [
           Expanded(
-            child: _uiItems.isEmpty
+            child: _uiItems.isEmpty && _streamingContent == null
                 ? const Center(
                     child: Text(
                       'Start a conversation…',
@@ -388,9 +507,21 @@ class _ChatScreenState extends State<ChatScreen> {
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.symmetric(vertical: 8),
-                    itemCount: _uiItems.length + (_isLoading ? 1 : 0),
+                    itemCount:
+                        _uiItems.length +
+                        (_isLoading || _streamingContent != null ? 1 : 0),
                     itemBuilder: (context, index) {
                       if (index == _uiItems.length) {
+                        // Show streamed content if tokens are arriving;
+                        // otherwise show the animated typing indicator.
+                        if (_streamingContent != null) {
+                          return ChatBubble(
+                            message: Message(
+                              role: 'assistant',
+                              content: _streamingContent!,
+                            ),
+                          );
+                        }
                         return const TypingIndicator();
                       }
                       final item = _uiItems[index];
@@ -452,7 +583,10 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
-/// Discriminated union for items in the chat UI list.
+// ---------------------------------------------------------------------------
+// Discriminated union for items in the chat UI list.
+// ---------------------------------------------------------------------------
+
 class _UiItem {
   final Message? message;
   final String? toolName;
